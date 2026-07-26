@@ -22,6 +22,7 @@ import logging
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
@@ -34,6 +35,12 @@ from bernstein.core.protocols.mcp.stateless_core import (
     compat_shim_active,
     legacy_session_header_value,
     months_since_deprecation,
+)
+from bernstein.mcp.approval_gate import (
+    completion_refusal_payload,
+    is_approvable,
+    is_worker_completable,
+    refusal_payload,
 )
 from bernstein.mcp.streaming import InFlightRegistry, cancelled_envelope
 
@@ -48,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8052"
 _HTTP_TIMEOUT = 5.0
+
+
+def _package_version() -> str:
+    """Return the installed Bernstein distribution version."""
+    try:
+        return version("bernstein")
+    except PackageNotFoundError:
+        return "0+unknown"
+
 
 # JSON-RPC error codes per spec.
 _PARSE_ERROR = -32700
@@ -323,7 +339,13 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
     {
         "name": "bernstein_approve",
-        "description": "Approve a pending/blocked task.",
+        "description": (
+            "Sign off a finished result that is waiting on a decision. Acts "
+            "only on a task in 'pending_approval'; any other status is "
+            "refused, including 'planned', which is released by approving "
+            "the plan it belongs to. Not a way to finish work - use "
+            "bernstein_complete for that."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -331,6 +353,23 @@ _TOOL_DEFS: list[dict[str, Any]] = [
                 "note": {"type": "string", "default": "Approved via MCP"},
             },
             "required": ["task_id"],
+        },
+    },
+    {
+        "name": "bernstein_complete",
+        "description": (
+            "Report the result of work you are executing. Acts only on a task "
+            "you hold ('open', 'claimed', 'in_progress'); a task waiting on "
+            "its subtasks, one whose worker is gone, or one already awaiting "
+            "a decision is refused."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "result_summary": {"type": "string"},
+            },
+            "required": ["task_id", "result_summary"],
         },
     },
     {
@@ -352,9 +391,36 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
+
+def validation_scope_notice() -> str:
+    """Return the interim notice about this transport's weaker argument checks.
+
+    This transport does not route ``tools/call`` through
+    ``bernstein.mcp.input_validation.validate_tool_call``, so the
+    deny-by-default input firewall documented in ``docs/mcp/input-validation.md``
+    covers the stdio and SSE servers only. It also exposes a subset of the
+    server's tools, with schemas restated here rather than loaded from
+    ``src/bernstein/mcp/tool_schemas/``.
+
+    The tool list is derived from ``_TOOL_DEFS`` so the notice cannot drift
+    from what the transport actually serves.
+
+    This is a notice, not a fix. Delete this function, its call site, its
+    tests and the matching doc sections in the same change that closes issue
+    #3083.
+    """
+    names = ", ".join(str(defn["name"]) for defn in _TOOL_DEFS)
+    return (
+        f"Streamable HTTP transport: argument validation on this path is weaker than on stdio. "
+        f"It exposes {len(_TOOL_DEFS)} tools ({names}) with schemas restated in this module, "
+        f"and does not apply the deny-by-default input validation the stdio transport applies. "
+        f"Tracked in issue #3083."
+    )
+
+
 _SERVER_INFO: dict[str, Any] = {
     "name": "bernstein",
-    "version": "1.0.0",
+    "version": _package_version(),
 }
 
 _CAPABILITIES: dict[str, Any] = {
@@ -943,21 +1009,46 @@ class StreamableHTTPTransport:
             return await self._proxy_post("/tasks", payload)
 
         if name == "bernstein_stop":
-            from pathlib import Path
+            from bernstein.mcp.signal_paths import shutdown_signal_path
 
-            workdir = arguments.get("workdir", ".")
-            signals_dir = Path(workdir) / ".sdd" / "runtime" / "signals"
-            signals_dir.mkdir(parents=True, exist_ok=True)
-            shutdown_file = signals_dir / "SHUTDOWN"
+            # Same barrier as the stdio surface: the workdir must name an
+            # existing project root and the signal path must stay inside it.
+            # A refusal raises and is rendered as the structured tool error,
+            # before any directory is created.
+            shutdown_file = shutdown_signal_path(arguments.get("workdir", "."))
+            shutdown_file.parent.mkdir(parents=True, exist_ok=True)
             shutdown_file.write_text("mcp-remote-stop\n", encoding="utf-8")
             return json.dumps({"status": "shutdown signal sent", "path": str(shutdown_file)})
 
         if name == "bernstein_approve":
             task_id = arguments["task_id"]
             note = arguments.get("note", "Approved via MCP")
+            # The gate is the same one the in-process server enforces: read
+            # the task first and refuse anything that is not holding a
+            # finished result for sign-off, so the remote transport is not a
+            # way around it.
+            raw_task = await self._proxy_get(f"/tasks/{task_id}")
+            current_status = str(json.loads(raw_task).get("status") or "")
+            if not is_approvable(current_status):
+                return json.dumps(refusal_payload(task_id, current_status), indent=2)
             return await self._proxy_post(
                 f"/tasks/{task_id}/complete",
                 {"result_summary": note},
+            )
+
+        if name == "bernstein_complete":
+            # Same read-before-act rule as the in-process server: a worker
+            # reports the result of a task it holds, and a task that is
+            # waiting on its subtasks or whose worker is gone is refused
+            # rather than marked done on request.
+            task_id = arguments["task_id"]
+            raw_task = await self._proxy_get(f"/tasks/{task_id}")
+            current_status = str(json.loads(raw_task).get("status") or "")
+            if not is_worker_completable(current_status):
+                return json.dumps(completion_refusal_payload(task_id, current_status), indent=2)
+            return await self._proxy_post(
+                f"/tasks/{task_id}/complete",
+                {"result_summary": arguments["result_summary"]},
             )
 
         if name == "bernstein_create_subtask":
@@ -1154,6 +1245,10 @@ def create_asgi_app(
         ASGI application callable.
     """
     cfg = config or RemoteMCPConfig()
+    # Interim notice (issue #3088). Emitted at WARNING so an operator sees it
+    # in ordinary startup output, not only with debug logging on. Remove with
+    # issue #3083.
+    logger.warning("%s", validation_scope_notice())
     transport = StreamableHTTPTransport(
         config=cfg,
         server_url=server_url,
